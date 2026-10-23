@@ -512,7 +512,8 @@ void CoreBackend::calculate() {
 
     output_rows_ = {0};
     if (n_samples != 1) {
-        plumed_assert((std::vector<std::string>(samples.names().begin(), samples.names().end()) == std::vector<std::string>{"system", "atom"}));
+        const auto sample_names = samples.names();
+        plumed_assert((std::vector<std::string>(sample_names.begin(), sample_names.end()) == std::vector<std::string>{"system", "atom"}));
         const auto samples_values = samples.values_cpu();
 
         // samples might be returned in any order. If the users picked some
