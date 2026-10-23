@@ -1,4 +1,4 @@
-plumed_needs=libmetatomic_core
+plumed_needs=libmetatomic
 plumed_modules=metatomic
 type=plumed
 arg="info --root"
