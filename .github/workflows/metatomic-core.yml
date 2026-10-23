@@ -1,7 +1,6 @@
 name: Metatomic core
 
 on:
-  push:
   pull_request:
 
 jobs:
@@ -19,7 +18,7 @@ jobs:
         echo "METATOMIC_PYTHON=$PYTHON_BIN" >> "$GITHUB_ENV"
     - name: Install dependencies
       run: |
-        python -m pip install 'torch>=2.7' 'metatensor-torch>=0.10.0,<0.11' 'featomic>=0.6.6,<0.7'
+        python -m pip install --extra-index-url https://download.pytorch.org/whl/cpu 'torch>=2.7' 'metatensor-torch>=0.10.0,<0.11' 'featomic>=0.6.6,<0.7'
         rustup toolchain install 1.88.0 --profile minimal
         RUSTUP_TOOLCHAIN=1.88.0 bash .ci/install.metatomic
     - name: Build PLUMED
@@ -29,15 +28,23 @@ jobs:
           CPPFLAGS="$CPPFLAGS -I$prefix/include -I$prefix/include/metatomic/third-party"
           LDFLAGS="$LDFLAGS -L$prefix/lib -Wl,-rpath,$prefix/lib"
         done
-        ./configure --disable-mpi --enable-modules=reset:metatomic --enable-libmetatomic-core \
+        ./configure --disable-mpi --enable-modules=reset:metatomic --enable-libmetatomic \
           CPPFLAGS="$CPPFLAGS" LDFLAGS="$LDFLAGS -lmetatomic -lmetatensor"
         make -j2
     - name: Check explicit gradients
       run: |
         source sourceme.sh
-        make -C regtest/metatomic/rt-core
-        make -C regtest/metatomic/rt-core-per-atom
+        make -C regtest/metatomic
         test -f regtest/metatomic/rt-core-per-atom/tmp/check
-        if grep -E 'FAILURE|NOT_APPLICABLE' regtest/metatomic/rt-core*/report.txt; then
+        if grep -E 'FAILURE|NOT_APPLICABLE' regtest/metatomic/rt-*/report.txt; then
+          exit 1
+        fi
+    - name: Check one Python runtime in both plugin load orders
+      run: |
+        source sourceme.sh
+        python -m pip install ./plugins/pycv --config-settings="cmake.define.Python_EXECUTABLE=$PYTHON_BIN"
+        PLUMED_METATOMIC_TEST_PYCV=1 make -C regtest/metatomic/rt-core-per-atom
+        test -f regtest/metatomic/rt-core-per-atom/tmp/check
+        if grep -E 'FAILURE|NOT_APPLICABLE' regtest/metatomic/rt-core-per-atom/report.txt; then
           exit 1
         fi
