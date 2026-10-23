@@ -39,3 +39,12 @@ jobs:
         if grep -E 'FAILURE|NOT_APPLICABLE' regtest/metatomic/rt-*/report.txt; then
           exit 1
         fi
+    - name: Check one Python runtime in both plugin load orders
+      run: |
+        source sourceme.sh
+        python -m pip install ./plugins/pycv --config-settings="cmake.define.Python_EXECUTABLE=$PYTHON_BIN"
+        PLUMED_METATOMIC_TEST_PYCV=1 make -C regtest/metatomic/rt-core-per-atom
+        test -f regtest/metatomic/rt-core-per-atom/tmp/check
+        if grep -E 'FAILURE|NOT_APPLICABLE' regtest/metatomic/rt-core-per-atom/report.txt; then
+          exit 1
+        fi
