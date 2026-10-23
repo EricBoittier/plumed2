@@ -32,10 +32,9 @@ Use arbitrary machine learning models as collective variables.
 
 !!! note
 
-    This action requires `libmetatomic` (for TorchScript models) or
-    `libmetatomic_core` (for plugin models) to be enabled and found. Check the
-    instructions in [the module page](module_metatomic.md) for more information
-    on how to enable this module.
+    This action requires `libmetatomic` (from metatomic-core) to be enabled and
+    found. Check the instructions in [the module page](module_metatomic.md) for
+    more information on how to enable this module.
 
 This action enables the use of fully custom machine learning models — based on
 the [metatomic] models interface — as collective variables in PLUMED. Such
@@ -72,12 +71,20 @@ the atomic type of the atoms that have been specified using the `SPECIES1` flag,
 the second number is the atomic number of the atoms that have been specified
 using the `SPECIES2` flag and so on.
 
+TorchScript models are executed through metatomic-core: PLUMED loads the Python
+plugin of metatomic-core and wraps the model in `metatomic_torch.legacy.LegacyModel`,
+so the Python environment found by the plugin needs `metatomic-torch` (and any
+package providing TorchScript extensions used by the model). Gradients of
+`system` features are computed with torch's automatic differentiation, while
+`atom` features can be used as CVs, but can not be biased.
+
 `METATOMIC` action also accepts the following options:
 
 - `EXTENSIONS_DIRECTORY` should be the path to a directory containing
   TorchScript extensions (as shared libraries) that are required to load and
   execute the model. This matches the `collect_extensions` argument to
   `AtomisticModel.export` in Python.
+- `DEVICE` can only be `cpu`, other devices are not supported yet;
 - `CHECK_CONSISTENCY` can be used to enable internal consistency checks;
 - `SELECTED_ATOMS` can be used to signal the metatomic models that it should
   only run its calculation for the selected subset of atoms. The model still
@@ -94,7 +101,7 @@ Here is another example with all the possible keywords:
 soap: METATOMIC ...
     MODEL=path/to/model.pt
     EXTENSIONS_DIRECTORY=path/to/extensions/
-    DEVICE=cuda
+    DEVICE=cpu
     CHECK_CONSISTENCY
 
     SPECIES1=1-10
@@ -109,25 +116,27 @@ soap: METATOMIC ...
 
 ## Plugin models
 
-When PLUMED is built with `--enable-libmetatomic-core`, models can also be
-loaded through the plugin interface of metatomic-core instead of TorchScript.
-This path is used as soon as `PLUGIN_LIBRARY` or `PLUGIN` is given:
+Models can also be loaded through any other plugin of metatomic-core. Unless
+`MODEL` is a TorchScript file (ending in `.pt`) and `PLUGIN` is not given,
+`MODEL` is forwarded to the plugins, and does not need to be a file:
 
 - `PLUGIN_LIBRARY` is the path to a shared library containing a metatomic
   plugin, which is registered before loading the model. Use `PLUGIN_LIBRARY1`,
-  `PLUGIN_LIBRARY2`, ... to register more than one plugin;
+  `PLUGIN_LIBRARY2`, ... to register more than one plugin. If it is not given,
+  the Python plugin installed next to the metatomic library used by PLUMED is
+  registered;
 - `PLUGIN` is the name of the plugin that should load `MODEL`. If it is not
   given, metatomic tries all registered plugins.
 
-`MODEL` is then forwarded to the plugin, and does not need to be a file. Plugin
-models run on CPU, and since there is no automatic differentiation on this path,
-the model must provide explicit `positions` and `strain` gradients of its
-`feature` output for PLUMED to apply forces. These gradients follow the metatensor
-gradient layout and store derivatives of the feature itself. `DEVICE` and
-`EXTENSIONS_DIRECTORY` can not be used with plugin models, and metatomic-core's
-consistency checks do not accept explicit gradients on `feature`, so
-`CHECK_CONSISTENCY` only works for plugin models that are used without biasing
-forces.
+For PLUMED to apply forces, the model must provide `positions` and `strain`
+gradients of its `feature` output explicitly. The pinned `metatomic.TorchModel`
+does not compute gradients for the standard `feature` output, for either
+per-system or per-atom samples. These gradients follow
+the metatensor gradient layout and store derivatives of the feature itself.
+`EXTENSIONS_DIRECTORY` can only be used with TorchScript models, and
+metatomic-core's consistency checks do not accept explicit gradients on
+`feature`, so `CHECK_CONSISTENCY` only works for models that are used without
+biasing forces.
 
 The simplest way to write such a model is a Python script that subclasses
 `metatomic.NumpyModel` and defines a module-level `model` variable. Such scripts
@@ -138,7 +147,6 @@ for a complete example.
 
 ```plumed
 cv: METATOMIC ...
-    PLUGIN_LIBRARY=path/to/metatomic-python-plugin.so
     PLUGIN=python
     MODEL=my_model.py
 
@@ -161,692 +169,6 @@ https://docs.metatensor.org/metatomic/latest/outputs/features.html
 //+ENDPLUMEDOC
 
 /*INDENT-OFF*/
-#if defined(__PLUMED_HAS_LIBMETATOMIC) 
-#include <type_traits>
-
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wpedantic"
-#pragma GCC diagnostic ignored "-Wunused-parameter"
-#pragma GCC diagnostic ignored "-Wfloat-equal"
-#pragma GCC diagnostic ignored "-Wfloat-conversion"
-#pragma GCC diagnostic ignored "-Wimplicit-float-conversion"
-#pragma GCC diagnostic ignored "-Wimplicit-int-conversion"
-#pragma GCC diagnostic ignored "-Wshorten-64-to-32"
-#pragma GCC diagnostic ignored "-Wsign-conversion"
-#pragma GCC diagnostic ignored "-Wold-style-cast"
-
-
-#pragma GCC diagnostic pop
-
-#include <metatensor.hpp>
-#include <metatomic.hpp>
-
-#include "vesin.h"
-
-
-namespace PLMD {
-namespace metatomic {
-
-// We will cast Vector/Tensor to pointers to arrays and doubles, so let's make
-// sure this is legal to do
-static_assert(std::is_standard_layout<PLMD::Vector>::value);
-static_assert(sizeof(PLMD::Vector) == sizeof(std::array<double, 3>));
-static_assert(alignof(PLMD::Vector) == alignof(std::array<double, 3>));
-
-static_assert(std::is_standard_layout<PLMD::Tensor>::value);
-static_assert(sizeof(PLMD::Tensor) == sizeof(std::array<std::array<double, 3>, 3>));
-static_assert(alignof(PLMD::Tensor) == alignof(std::array<std::array<double, 3>, 3>));
-
-/// Small helper class to compute one neighbor list requested by the metatomc
-/// model using vesin
-class NeighborListCalculator {
-public:
-    NeighborListCalculator(
-        metatomic_torch::NeighborListOptions options,
-        const std::string& engine_length_unit
-    );
-    ~NeighborListCalculator();
-
-    NeighborListCalculator(const NeighborListCalculator& other) = delete;
-    NeighborListCalculator& operator=(const NeighborListCalculator& other) = delete;
-
-    NeighborListCalculator(NeighborListCalculator&& other) noexcept;
-    NeighborListCalculator& operator=(NeighborListCalculator&& other) noexcept;
-
-    // compute the neighbor list following metatomic format, using data from PLUMED
-    metatensor_torch::TensorBlock compute(
-        const std::vector<PLMD::Vector>& positions,
-        const PLMD::Tensor& cell,
-        std::array<bool, 3> periodic,
-        torch::ScalarType dtype,
-        torch::Device device
-    );
-
-    metatomic_torch::NeighborListOptions options;
-private:
-    double engine_cutoff_;
-    vesin::VesinNeighborList neighbors_;
-};
-
-NeighborListCalculator::NeighborListCalculator(
-    metatomic_torch::NeighborListOptions options_,
-    const std::string& engine_length_unit
-):
-    options(options_),
-    engine_cutoff_(options_->engine_cutoff(engine_length_unit))
-{
-    memset(&this->neighbors_, 0, sizeof(vesin::VesinNeighborList));
-}
-
-NeighborListCalculator::NeighborListCalculator(NeighborListCalculator&& other) noexcept {
-    this->options = other.options;
-    this->engine_cutoff_ = other.engine_cutoff_;
-    this->neighbors_ = other.neighbors_;
-
-    memset(&other.neighbors_, 0, sizeof(vesin::VesinNeighborList));
-}
-
-NeighborListCalculator& NeighborListCalculator::operator=(NeighborListCalculator&& other) noexcept {
-    if (this != &other) {
-        vesin::vesin_free(&this->neighbors_);
-
-        this->options = other.options;
-        this->engine_cutoff_ = other.engine_cutoff_;
-        this->neighbors_ = other.neighbors_;
-
-        memset(&other.neighbors_, 0, sizeof(vesin::VesinNeighborList));
-    }
-    return *this;
-}
-
-NeighborListCalculator::~NeighborListCalculator() {
-    vesin::vesin_free(&this->neighbors_);
-}
-
-metatensor_torch::TensorBlock NeighborListCalculator::compute(
-    const std::vector<PLMD::Vector>& positions,
-    const PLMD::Tensor& cell,
-    std::array<bool, 3> periodic,
-    torch::ScalarType dtype,
-    torch::Device device
-) {
-    auto labels_options = torch::TensorOptions().dtype(torch::kInt32).device(device);
-    auto neighbor_component = torch::make_intrusive<metatensor_torch::LabelsHolder>(
-        "xyz",
-        torch::tensor({0, 1, 2}, labels_options).reshape({3, 1})
-    );
-    auto neighbor_properties = torch::make_intrusive<metatensor_torch::LabelsHolder>(
-        "distance", torch::zeros({1, 1}, labels_options)
-    );
-
-    // use https://github.com/Luthaf/vesin to compute the requested neighbor
-    // lists since we can not get these from PLUMED
-    vesin::VesinOptions vesin_options{};
-    vesin_options.cutoff = this->engine_cutoff_;
-    vesin_options.full = this->options->full_list();
-    vesin_options.return_shifts = true;
-    vesin_options.return_distances = false;
-    vesin_options.return_vectors = true;
-    vesin_options.algorithm = vesin::VesinAutoAlgorithm;
-
-    const char* error_message = nullptr;
-    int status = vesin_neighbors(
-        reinterpret_cast<const double (*)[3]>(positions.data()),
-        positions.size(),
-        reinterpret_cast<const double (*)[3]>(&cell(0, 0)),
-        periodic.data(),
-        {vesin::VesinCPU, 0},
-        vesin_options,
-        &this->neighbors_,
-        &error_message
-    );
-
-    if (status != EXIT_SUCCESS) {
-        plumed_merror(
-            "failed to compute neighbor list (cutoff=" + std::to_string(this->engine_cutoff_) +
-            ", full=" + (this->options->full_list() ? "true" : "false") + "): " + error_message
-        );
-    }
-
-    // transform from vesin to metatomic format
-    auto n_pairs = static_cast<int64_t>(this->neighbors_.length);
-
-    auto pair_vectors = torch::from_blob(
-        this->neighbors_.vectors,
-        {n_pairs, 3, 1},
-        torch::TensorOptions().dtype(torch::kFloat64).device(torch::kCPU)
-    );
-
-    auto pair_samples_values = torch::empty({n_pairs, 5}, labels_options.device(torch::kCPU));
-    auto pair_samples_values_ptr = pair_samples_values.accessor<int32_t, 2>();
-    for (unsigned i=0; i<n_pairs; i++) {
-        pair_samples_values_ptr[i][0] = static_cast<int32_t>(this->neighbors_.pairs[i][0]);
-        pair_samples_values_ptr[i][1] = static_cast<int32_t>(this->neighbors_.pairs[i][1]);
-        pair_samples_values_ptr[i][2] = this->neighbors_.shifts[i][0];
-        pair_samples_values_ptr[i][3] = this->neighbors_.shifts[i][1];
-        pair_samples_values_ptr[i][4] = this->neighbors_.shifts[i][2];
-    }
-
-    auto neighbor_samples = torch::make_intrusive<metatensor_torch::LabelsHolder>(
-        std::vector<std::string>{"first_atom", "second_atom", "cell_shift_a", "cell_shift_b", "cell_shift_c"},
-        pair_samples_values.to(device),
-        // vesin should create unique pairs
-        metatensor::assume_unique{}
-    );
-
-    auto neighbors = torch::make_intrusive<metatensor_torch::TensorBlockHolder>(
-        pair_vectors.to(dtype).to(device),
-        neighbor_samples,
-        std::vector<metatensor_torch::Labels>{neighbor_component},
-        neighbor_properties
-    );
-
-    return neighbors;
-}
-
-/// Run TorchScript models exported with metatomic-torch, using torch autograd
-/// to get the derivatives of the CV
-class TorchBackend final: public MetatomicPlumedAction::Backend {
-public:
-    explicit TorchBackend(MetatomicPlumedAction& action);
-
-    void calculate() override;
-    void apply() override;
-
-private:
-    // fill this->system_ according to the current PLUMED data
-    void createSystem();
-
-    // execute the model for the given system
-    metatensor_torch::TensorBlock executeModel(metatomic_torch::System system);
-
-    MetatomicPlumedAction& action_;
-
-    metatensor_torch::Module model_;
-
-    metatomic_torch::ModelCapabilities capabilities_;
-    // name of the output we request
-    std::string features_key;
-
-    // neighbor lists requests made by the model and the corresponding data
-    std::vector<NeighborListCalculator> neighbor_lists_;
-
-    // dtype/device to use to execute the model
-    torch::ScalarType dtype_;
-    torch::Device device_;
-
-    torch::Tensor atomic_types_;
-    // store the strain to be able to compute the virial with autograd
-    torch::Tensor strain_;
-
-    metatomic_torch::System system_;
-    metatomic_torch::ModelEvaluationOptions evaluations_options_;
-    bool check_consistency_;
-
-    metatensor_torch::TensorMap output_;
-    // row of the PLUMED value where each sample of `output_` is stored
-    std::vector<unsigned> output_rows_;
-};
-
-TorchBackend::TorchBackend(MetatomicPlumedAction& action):
-    action_(action),
-    model_(torch::jit::Module()),
-    device_(torch::kCPU)
-{
-    auto& log = action.log;
-
-    if (metatomic_torch::version().find("0.1.") != 0) {
-        action.error(
-            "this code requires version 0.1.x of metatomic-torch, got version " +
-            metatomic_torch::version()
-        );
-    }
-
-    // first, load the model
-    std::string extensions_directory_str;
-    action.parse("EXTENSIONS_DIRECTORY", extensions_directory_str);
-
-    torch::optional<std::string> extensions_directory = torch::nullopt;
-    if (!extensions_directory_str.empty()) {
-        extensions_directory = std::move(extensions_directory_str);
-    }
-
-    std::string model_path;
-    action.parse("MODEL", model_path);
-
-    try {
-        this->model_ = metatomic_torch::load_atomistic_model(model_path, extensions_directory);
-    } catch (const std::exception& e) {
-        action.error("failed to load model at '" + model_path + "': " + e.what());
-    }
-
-    // extract information from the model
-    auto metadata = this->model_.run_method("metadata").toCustomClass<metatomic_torch::ModelMetadataHolder>();
-    this->capabilities_ = this->model_.run_method("capabilities").toCustomClass<metatomic_torch::ModelCapabilitiesHolder>();
-    auto nl_requests_ivalue = this->model_.run_method("requested_neighbor_lists");
-    for (auto nl_request_ivalue: nl_requests_ivalue.toList()) {
-        auto nl_request = nl_request_ivalue.get().toCustomClass<metatomic_torch::NeighborListOptionsHolder>();
-        this->neighbor_lists_.emplace_back(nl_request, action.getUnits().getLengthString());
-    }
-
-    auto extra_inputs = this->model_.run_method("requested_inputs").toGenericDict();
-    auto standard_inputs = std::vector<std::string>{};
-    auto custom_inputs = std::vector<std::string>{};
-    for (const auto& item: extra_inputs) {
-        auto key = item.key().toStringRef();
-        if (key.find("::") != std::string::npos) {
-            custom_inputs.push_back(key);
-        } else {
-            standard_inputs.push_back(key);
-        }
-    }
-
-    if (!standard_inputs.empty()) {
-        action.error(
-            "The model requested extra inputs that are not yet supported in PLUMED. "
-            "Please open an issue to request support for the following inputs: " +
-            torch::str(standard_inputs)
-        );
-    }
-
-    if (!custom_inputs.empty()) {
-        action.error(
-            "The model requested custom inputs (" + torch::str(custom_inputs) + ") "
-            "that can not be provided by PLUMED. Please change your model to use "
-            "standard inputs only."
-        );
-    }
-
-    log.printf("\n%s\n", metadata->print().c_str());
-    // add the model references to PLUMED citation handling mechanism
-    for (const auto& it: metadata->references) {
-        for (const auto& ref: it.value()) {
-            action.cite(ref);
-        }
-    }
-
-    this->atomic_types_ = torch::tensor(action.parseAtomicTypes());
-
-    this->check_consistency_ = false;
-    action.parseFlag("CHECK_CONSISTENCY", this->check_consistency_);
-    if (this->check_consistency_) {
-        log.printf("  checking for internal consistency of the model\n");
-    }
-
-    // create evaluation options for the model. These won't change during the
-    // simulation, so we initialize them once here.
-    evaluations_options_ = torch::make_intrusive<metatomic_torch::ModelEvaluationOptionsHolder>();
-    evaluations_options_->set_length_unit(action.getUnits().getLengthString());
-
-    auto outputs = this->capabilities_->outputs();
-
-    std::string requested_variant;
-    torch::optional<std::string> requested_variant_opt = torch::nullopt;
-    action.parse("VARIANT", requested_variant);
-    if (!requested_variant.empty()) {
-        requested_variant_opt = requested_variant;
-    }
-
-    this->features_key = metatomic_torch::pick_output("features", outputs, requested_variant_opt);
-
-    auto output = torch::make_intrusive<metatomic_torch::ModelOutputHolder>();
-    // this output has no quantity or unit to set
-
-    output->set_sample_kind(this->capabilities_->outputs().at(this->features_key)->sample_kind());
-    // we are using torch autograd system to compute gradients,
-    // so we don't need any explicit gradients.
-    output->explicit_gradients = {};
-    evaluations_options_->outputs.insert(this->features_key, output);
-
-    std::string requested_device;
-    torch::optional<std::string> requested_device_opt = torch::nullopt;
-    action.parse("DEVICE", requested_device);
-    if (!requested_device.empty()) {
-        requested_device_opt = requested_device;
-    }
-
-    this->device_ = torch::Device(
-        metatomic_torch::pick_device(this->capabilities_->supported_devices, requested_device_opt),
-        /*index=*/ 0
-    );
-
-    this->model_.to(this->device_);
-    this->atomic_types_ = this->atomic_types_.to(this->device_);
-
-    log.printf(
-        "  running model on %s device with %s data\n",
-        this->device_.str().c_str(),
-        this->capabilities_->dtype().c_str()
-    );
-
-    if (this->capabilities_->dtype() == "float64") {
-        this->dtype_ = torch::kFloat64;
-    } else if (this->capabilities_->dtype() == "float32") {
-        this->dtype_ = torch::kFloat32;
-    } else {
-        action.error(
-            "the model requested an unsupported dtype '" + this->capabilities_->dtype() + "'"
-        );
-    }
-
-    auto tensor_options = torch::TensorOptions().dtype(this->dtype_).device(this->device_);
-    this->strain_ = torch::eye(3, tensor_options.requires_grad(true));
-
-    // determine how many properties there will be in the output by running the
-    // model once on a dummy system
-    auto dummy_system = torch::make_intrusive<metatomic_torch::SystemHolder>(
-        /*types = */ torch::zeros({0}, tensor_options.dtype(torch::kInt32)),
-        /*positions = */ torch::zeros({0, 3}, tensor_options),
-        /*cell = */ torch::zeros({3, 3}, tensor_options),
-        /*pbc = */ torch::zeros({3}, tensor_options.dtype(torch::kBool))
-    );
-
-    log.printf("  the following neighbor lists have been requested:\n");
-    auto length_unit = action.getUnits().getLengthString();
-    auto model_length_unit = this->capabilities_->length_unit();
-    for (auto& nl: this->neighbor_lists_) {
-        log.printf("    - %s list, %g %s cutoff (requested %g %s)\n",
-            nl.options->full_list() ? "full" : "half",
-            nl.options->engine_cutoff(length_unit),
-            length_unit.c_str(),
-            nl.options->cutoff(),
-            model_length_unit.c_str()
-        );
-
-        auto neighbors = nl.compute(
-            {PLMD::Vector(0, 0, 0)},
-            PLMD::Tensor(0, 0, 0, 0, 0, 0, 0, 0, 0),
-            {false, false, false},
-            this->dtype_,
-            this->device_
-        );
-        metatomic_torch::register_autograd_neighbors(dummy_system, neighbors, this->check_consistency_);
-        dummy_system->add_neighbor_list(nl.options, neighbors);
-    }
-
-    auto n_properties = static_cast<unsigned>(
-        this->executeModel(dummy_system)->properties()->count()
-    );
-
-    // parse and handle atom sub-selection. This is done AFTER determining the
-    // output size, since the selection might not be valid for the dummy system
-    auto n_atoms = static_cast<size_t>(this->atomic_types_.size(0));
-    auto selected_atoms = action.parseSelectedAtoms(n_atoms);
-    if (!selected_atoms.empty()) {
-        auto selection_value = torch::zeros(
-            {static_cast<int64_t>(selected_atoms.size()), 2},
-            torch::TensorOptions().dtype(torch::kInt32).device(this->device_)
-        );
-
-        for (unsigned i=0; i<selected_atoms.size(); i++) {
-            selection_value[i][1] = static_cast<int32_t>(selected_atoms[i].index());
-        }
-
-        evaluations_options_->set_selected_atoms(
-            torch::make_intrusive<metatensor_torch::LabelsHolder>(
-                std::vector<std::string>{"system", "atom"}, selection_value
-            )
-        );
-    }
-
-    // Now that we now both n_samples and n_properties, we can setup the
-    // PLUMED-side storage for the computed CV
-    unsigned n_samples = 1;
-    if (output->sample_kind() == "atom") {
-        n_samples = static_cast<unsigned>(selected_atoms.empty() ? n_atoms : selected_atoms.size());
-    } else {
-        assert(output->sample_kind() == "system");
-    }
-
-    action.addOutputValue(n_samples, n_properties);
-}
-
-
-void TorchBackend::createSystem() {
-    if (action_.getTotAtoms() != static_cast<unsigned>(this->atomic_types_.size(0))) {
-        std::ostringstream oss;
-        oss << "METATOMIC action needs to know about all atoms in the system. ";
-        oss << "There are " << action_.getTotAtoms() << " atoms overall, ";
-        oss << "but we only have atomic types for " << this->atomic_types_.size(0) << " of them.";
-        plumed_merror(oss.str());
-    }
-
-    auto [cell, periodic] = action_.cellAndPeriodicity();
-
-    auto cpu_f64_tensor = torch::TensorOptions().dtype(torch::kFloat64).device(torch::kCPU);
-    auto torch_cell = torch::from_blob(&cell(0, 0), {3, 3}, cpu_f64_tensor).clone();
-
-    auto torch_pbc = torch::zeros({3}, torch::TensorOptions().dtype(torch::kBool).device(torch::kCPU));
-    for (unsigned i=0; i<3; i++) {
-        torch_pbc[i] = periodic[i];
-    }
-
-    const auto& positions = action_.getPositions();
-
-    auto torch_positions = torch::from_blob(
-        const_cast<PLMD::Vector*>(positions.data()),
-        {static_cast<int64_t>(positions.size()), 3},
-        cpu_f64_tensor
-    );
-
-    torch_positions = torch_positions.to(this->dtype_).to(this->device_);
-    torch_cell = torch_cell.to(this->dtype_).to(this->device_);
-    torch_pbc = torch_pbc.to(this->device_);
-
-    // setup torch's automatic gradient tracking
-    if (!action_.doNotCalculateDerivatives()) {
-        torch_positions.requires_grad_(true);
-
-        // pretend to scale positions/cell by the strain so that it enters the
-        // computational graph.
-        torch_positions = torch_positions.matmul(this->strain_);
-        torch_positions.retain_grad();
-
-        torch_cell = torch_cell.matmul(this->strain_);
-    }
-
-    this->system_ = torch::make_intrusive<metatomic_torch::SystemHolder>(
-        this->atomic_types_,
-        torch_positions,
-        torch_cell,
-        torch_pbc
-    );
-
-    // compute the neighbors list requested by the model, and register them with
-    // the system
-    for (auto& nl: this->neighbor_lists_) {
-        auto neighbors = nl.compute(positions, cell, periodic, this->dtype_, this->device_);
-        metatomic_torch::register_autograd_neighbors(this->system_, neighbors, this->check_consistency_);
-        this->system_->add_neighbor_list(nl.options, neighbors);
-    }
-}
-
-
-metatensor_torch::TensorBlock TorchBackend::executeModel(metatomic_torch::System system) {
-    try {
-        auto ivalue_output = this->model_.forward({
-            std::vector<metatomic_torch::System>{system},
-            evaluations_options_,
-            this->check_consistency_,
-        });
-
-        auto dict_output = ivalue_output.toGenericDict();
-        auto cv = dict_output.at(this->features_key);
-        this->output_ = cv.toCustomClass<metatensor_torch::TensorMapHolder>();
-    } catch (const std::exception& e) {
-        plumed_merror("failed to evaluate the model: " + std::string(e.what()));
-    }
-
-    plumed_massert(this->output_->keys()->count() == 1, "output should have a single block");
-    auto block = metatensor_torch::TensorMapHolder::block_by_id(this->output_, 0);
-    plumed_massert(block->components().empty(), "components are not yet supported in the output");
-
-    return block;
-}
-
-
-void TorchBackend::calculate() {
-    this->createSystem();
-
-    auto block = this->executeModel(this->system_);
-    auto torch_values = block->values().to(torch::kCPU).to(torch::kFloat64).contiguous();
-
-    auto n_samples = action_.n_samples_;
-    auto n_properties = action_.n_properties_;
-    if (static_cast<unsigned>(torch_values.size(0)) != n_samples) {
-        plumed_merror(
-            "expected the model to return a TensorBlock with " +
-            std::to_string(n_samples) + " samples, got " +
-            std::to_string(torch_values.size(0)) + " instead"
-        );
-    } else if (static_cast<unsigned>(torch_values.size(1)) != n_properties) {
-        plumed_merror(
-            "expected the model to return a TensorBlock with " +
-            std::to_string(n_properties) + " properties, got " +
-            std::to_string(torch_values.size(1)) + " instead"
-        );
-    }
-
-    this->output_rows_ = {0};
-    if (n_samples != 1) {
-        auto samples = block->samples();
-        plumed_assert((samples->names() == std::vector<std::string>{"system", "atom"}));
-
-        auto samples_values = samples->values().to(torch::kCPU);
-        auto selected_atoms = this->evaluations_options_->get_selected_atoms();
-
-        // handle the possibility that samples are returned in a non-sorted
-        // order. If the users picked some selected atoms, then we store the
-        // output in the same order as the selection was given
-        this->output_rows_.resize(n_samples);
-        for (unsigned i=0; i<n_samples; i++) {
-            if (selected_atoms.has_value()) {
-                auto sample = samples_values.index({static_cast<int64_t>(i), torch::indexing::Slice()});
-                auto position = selected_atoms.value()->position(sample);
-                plumed_assert(position.has_value());
-                this->output_rows_[i] = static_cast<unsigned>(position.value());
-            } else {
-                this->output_rows_[i] = static_cast<unsigned>(samples_values[i][1].item<int32_t>());
-            }
-        }
-    }
-
-    const auto* data = torch_values.data_ptr<double>();
-    action_.setOutputValues(this->output_rows_, std::vector<double>(data, data + torch_values.numel()));
-}
-
-
-void TorchBackend::apply() {
-    const auto* value = action_.getPntrToComponent(0);
-    if (!value->forcesWereAdded()) {
-        return;
-    }
-
-    auto block = metatensor_torch::TensorMapHolder::block_by_id(this->output_, 0);
-    auto torch_values = block->values().to(torch::kCPU).to(torch::kFloat64);
-
-    if (!torch_values.requires_grad()) {
-        action_.warning(
-            "the output of the model does not requires gradients, this might "
-            "indicate a problem"
-        );
-        return;
-    }
-
-    auto forces = action_.outputForces(this->output_rows_);
-    auto output_grad = torch::from_blob(
-        forces.data(),
-        torch_values.sizes(),
-        torch::TensorOptions().dtype(torch::kFloat64).device(torch::kCPU)
-    );
-
-    this->system_->positions().mutable_grad() = torch::Tensor();
-    this->strain_.mutable_grad() = torch::Tensor();
-
-    torch_values.backward(output_grad);
-    auto positions_grad = this->system_->positions().grad();
-    auto strain_grad = this->strain_.grad();
-
-    positions_grad = positions_grad.to(torch::kCPU).to(torch::kFloat64);
-    strain_grad = strain_grad.to(torch::kCPU).to(torch::kFloat64);
-
-    plumed_assert(positions_grad.sizes().size() == 2);
-    plumed_assert(positions_grad.is_contiguous());
-
-    plumed_assert(strain_grad.sizes().size() == 2);
-    plumed_assert(strain_grad.is_contiguous());
-
-    auto derivatives = std::vector<double>(
-        positions_grad.data_ptr<double>(),
-        positions_grad.data_ptr<double>() + 3 * this->system_->size()
-    );
-
-    // add virials to the derivatives
-    derivatives.push_back(-strain_grad[0][0].item<double>());
-    derivatives.push_back(-strain_grad[0][1].item<double>());
-    derivatives.push_back(-strain_grad[0][2].item<double>());
-
-    derivatives.push_back(-strain_grad[1][0].item<double>());
-    derivatives.push_back(-strain_grad[1][1].item<double>());
-    derivatives.push_back(-strain_grad[1][2].item<double>());
-
-    derivatives.push_back(-strain_grad[2][0].item<double>());
-    derivatives.push_back(-strain_grad[2][1].item<double>());
-    derivatives.push_back(-strain_grad[2][2].item<double>());
-
-    unsigned index = 0;
-    action_.setForcesOnAtoms(derivatives, index);
-}
-
-std::unique_ptr<MetatomicPlumedAction::Backend> makeTorchBackend(MetatomicPlumedAction& action) {
-    return std::make_unique<TorchBackend>(action);
-}
-
-} // namespace metatomic
-} // namespace PLMD
-
-#else
-
-namespace PLMD {
-namespace metatomic {
-
-std::unique_ptr<MetatomicPlumedAction::Backend> makeTorchBackend(MetatomicPlumedAction& action) {
-    action.error(
-        "this PLUMED was built without TorchScript support for metatomic. "
-        "Configure with `--enable-libmetatomic --enable-libtorch` to load TorchScript "
-        "models, or set PLUGIN_LIBRARY/PLUGIN to load a metatomic-core plugin model"
-    );
-}
-
-} // namespace metatomic
-} // namespace PLMD
-
-#endif
-
-
-#ifndef __PLUMED_HAS_LIBMETATOMIC_CORE
-
-namespace PLMD {
-namespace metatomic {
-
-std::unique_ptr<MetatomicPlumedAction::Backend> makeCoreBackend(
-    MetatomicPlumedAction& action,
-    const std::vector<std::string>&,
-    const std::string&
-) {
-    action.error(
-        "PLUGIN_LIBRARY and PLUGIN require metatomic-core. Configure with "
-        "`--enable-libmetatomic-core` and make sure the metatomic and metatensor "
-        "libraries are found"
-    );
-}
-
-} // namespace metatomic
-} // namespace PLMD
-
-#endif
-
-
 namespace PLMD {
 namespace metatomic {
 
@@ -855,12 +177,11 @@ MetatomicPlumedAction::MetatomicPlumedAction(const ActionOptions& options):
     ActionAtomistic(options),
     ActionWithValue(options)
 {
-#if !(defined(__PLUMED_HAS_LIBMETATOMIC) && defined(__PLUMED_HAS_LIBTORCH)) && !defined(__PLUMED_HAS_LIBMETATOMIC_CORE)
+#ifndef __PLUMED_HAS_LIBMETATOMIC
     this->error(
         "Can not use metatomic action without the corresponding libraries. \n"
-        "Make sure to configure with `--enable-libmetatomic --enable-libtorch` "
-        "(TorchScript models) or `--enable-libmetatomic-core` (plugin models), "
-        "and that the corresponding libraries are found"
+        "Make sure to configure with `--enable-libmetatomic` and that the "
+        "metatomic and metatensor libraries are found"
     );
 #else
     std::vector<std::string> plugin_libraries;
@@ -876,11 +197,7 @@ MetatomicPlumedAction::MetatomicPlumedAction(const ActionOptions& options):
     std::string plugin;
     this->parse("PLUGIN", plugin);
 
-    if (plugin_libraries.empty() && plugin.empty()) {
-        backend_ = makeTorchBackend(*this);
-    } else {
-        backend_ = makeCoreBackend(*this, plugin_libraries, plugin);
-    }
+    backend_ = makeCoreBackend(*this, plugin_libraries, plugin);
 #endif
 }
 
@@ -1091,9 +408,9 @@ void MetatomicPlumedAction::registerKeywords(Keywords& keys) {
     ActionAtomistic::registerKeywords(keys);
     ActionWithValue::registerKeywords(keys);
 
-    keys.add("compulsory", "MODEL", "path to the exported metatomic model, or model name passed to the metatomic-core plugin");
+    keys.add("compulsory", "MODEL", "path to the exported TorchScript model, or model passed to the metatomic plugin");
     keys.add("optional", "EXTENSIONS_DIRECTORY", "path to the directory containing TorchScript extensions to load");
-    keys.add("optional", "DEVICE", "Torch device to use for the calculations");
+    keys.add("optional", "DEVICE", "device to use for the calculations, only 'cpu' is supported");
 
     keys.add("numbered", "PLUGIN_LIBRARY", "shared library containing a metatomic-core plugin to register before loading the model");
     keys.add("optional", "PLUGIN", "name of the metatomic-core plugin used to load the model");
