@@ -255,7 +255,7 @@ std::vector<int32_t> MetatomicPlumedAction::parseAtomicTypes() {
 
             log.printf("  atoms with type %d are: ", type);
             for(unsigned j=0; j<atoms.size(); j++) {
-                log.printf("%d ", atoms[j]);
+                log.printf("%u ", atoms[j].serial());
             }
             log.printf("\n");
 
@@ -394,7 +394,9 @@ std::vector<double> MetatomicPlumedAction::outputForces(const std::vector<unsign
         return {value->getForce()};
     }
 
-    auto forces = std::vector<double>(n_samples_ * n_properties_);
+    auto forces = std::vector<double>(
+        static_cast<size_t>(n_samples_) * static_cast<size_t>(n_properties_)
+    );
     for (unsigned i=0; i<n_samples_; i++) {
         for (unsigned j=0; j<n_properties_; j++) {
             forces[i * n_properties_ + j] = value->getForce(rows[i] * n_properties_ + j);
