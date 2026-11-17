@@ -1,0 +1,50 @@
+plumed_needs="metatomic:libmetatomic metatomic:libtorch"
+plumed_modules=metatomic
+type=driver
+
+arg="--plumed plumed.dat --ixyz structure.xyz --length-units A"
+export PLUMED_STACK_TRACE=no
+
+# Both checks here guard a buffer that is sized by one quantity and indexed by
+# another: `atomic_types` is sized from the SPECIES entries and written at the
+# absolute atom index, and SELECTED_ATOMS is bounded against the atom count while
+# holding a 0-based index. Each bad_NAME.dat below used to write out of bounds,
+# silently assign the wrong type, or pass an out-of-range atom to the model.
+function plumed_regtest_before(){
+  {
+    echo 9 ; echo 10 10 10
+    echo C 0.0 0.0 0.0 ; echo O 1.1 0.0 0.0 ; echo O 0.0 1.1 0.0
+    echo C 0.0 0.0 1.1 ; echo O 1.1 1.1 0.0 ; echo O 1.1 0.0 1.1
+    echo C 0.0 1.1 1.1 ; echo O 1.1 1.1 1.1 ; echo O 2.2 0.0 0.0
+  } > structure.xyz
+
+  python cv.py && echo Generated model using cv.py
+
+  printf 'd: DISTANCE ATOMS=1,2\nPRINT ARG=d FILE=colvar FMT=%%8.4f\n' > plumed.dat
+
+  # a gap in the middle: sized by the 6 listed atoms, written at index 6
+  printf 'cv: METATOMIC MODEL=model.pt DEVICE=cpu SPECIES1=1,2,3 SPECIES2=5,6,7 SPECIES_TO_TYPES=6,8\nPRINT ARG=cv FILE=out\n' > bad_species_gap.dat
+  # does not start at atom 1: sized by the 5 listed atoms, written at index 8
+  printf 'cv: METATOMIC MODEL=model.pt DEVICE=cpu SPECIES1=5,6,7 SPECIES2=8,9 SPECIES_TO_TYPES=6,8\nPRINT ARG=cv FILE=out\n' > bad_species_offset.dat
+  # atom 5 listed twice: large enough to fit, but one of the two types is lost
+  printf 'cv: METATOMIC MODEL=model.pt DEVICE=cpu SPECIES1=1,2,3,4,5 SPECIES2=5,6,7,8,9 SPECIES_TO_TYPES=6,8\nPRINT ARG=cv FILE=out\n' > bad_species_duplicate.dat
+  # atom 10 of 9: `index()` is 0-based, so the bound has to be `>=`
+  printf 'cv: METATOMIC MODEL=model-per-atom.pt DEVICE=cpu SPECIES=1-9 SPECIES_TO_TYPES=6 SELECTED_ATOMS=1,10\ns: SUM ARG=cv PERIODIC=NO\nPRINT ARG=s FILE=out\n' > bad_selected_atoms.dat
+}
+
+function plumed_regtest_after(){
+  rm -f errors
+  while read -r name text ; do
+    $plumed driver --plumed bad_$name.dat --ixyz structure.xyz --length-units A > bad_$name.out 2> bad_$name.err
+    if test $? -ne 0 && grep -q -F "$text" bad_$name.out bad_$name.err && ! grep -q "assertion failed" bad_$name.out bad_$name.err ; then
+      echo "$name: rejected" >> errors
+    else
+      echo "$name: NOT REJECTED PROPERLY" >> errors
+    fi
+  done <<'EOT'
+species_gap the SPECIES entries should cover all atoms from 1 to 7, but atom 4 is missing
+species_offset the SPECIES entries should cover all atoms from 1 to 9, but atom 1 is missing
+species_duplicate atom 5 appears in more than one SPECIES
+selected_atoms Values in metatomic's SELECTED_ATOMS should be between 1 and the number of atoms (9), got 10
+EOT
+}

@@ -498,13 +498,23 @@ MetatomicPlumedAction::MetatomicPlumedAction(const ActionOptions& options):
             atoms_per_species.emplace_back(std::move(atoms));
         }
 
-        size_t n_atoms = 0;
+        // `atomic_types` is indexed by the absolute atom index below, so it has
+        // to be sized by the largest index the SPECIES entries mention, not by
+        // how many atoms they list. Sizing it by the count overflows the vector
+        // for any SPECIES that does not start at atom 1 and run contiguously.
+        size_t types_size = 0;
         for (const auto& atoms: atoms_per_species) {
-            n_atoms += atoms.size();
+            for (const auto& atom: atoms) {
+                auto index = static_cast<size_t>(atom.index()) + 1;
+                if (index > types_size) {
+                    types_size = index;
+                }
+            }
         }
 
         // then fill the atomic_types as required
-        atomic_types.resize(n_atoms, 0);
+        atomic_types.resize(types_size, 0);
+        auto assigned = std::vector<bool>(types_size, false);
         i = 0;
         for (const auto& atoms: atoms_per_species) {
             i += 1;
@@ -515,7 +525,25 @@ MetatomicPlumedAction::MetatomicPlumedAction(const ActionOptions& options):
             }
 
             for (const auto& atom: atoms) {
+                if (assigned[atom.index()]) {
+                    this->error(
+                        "atom " + std::to_string(atom.serial()) +
+                        " appears in more than one SPECIES"
+                    );
+                }
+                assigned[atom.index()] = true;
                 atomic_types[atom.index()] = type;
+            }
+        }
+
+        // a gap in the middle would otherwise be a silent type 0
+        for (size_t atom=0; atom<types_size; atom++) {
+            if (!assigned[atom]) {
+                this->error(
+                    "the SPECIES entries should cover all atoms from 1 to " +
+                    std::to_string(types_size) + ", but atom " +
+                    std::to_string(AtomNumber::index(atom).serial()) + " is missing"
+                );
             }
         }
     } else {
@@ -658,7 +686,8 @@ MetatomicPlumedAction::MetatomicPlumedAction(const ActionOptions& options):
 
         for (unsigned i=0; i<selected_atoms.size(); i++) {
             auto n_atoms = this->atomic_types_.size(0);
-            if (selected_atoms[i].index() > n_atoms) {
+            // `index()` is 0-based, so the last valid value is `n_atoms - 1`
+            if (selected_atoms[i].index() >= n_atoms) {
                 this->error(
                     "Values in metatomic's SELECTED_ATOMS should be between 1 "
                     "and the number of atoms (" + std::to_string(n_atoms) + "), "
